@@ -82,7 +82,7 @@ pub fn get_set_info(set_name: &str) -> Option<SetInfo> {
     parse_ipset_list_output(&stdout)
 }
 
-fn parse_ipset_list_output(output: &str) -> Option<SetInfo> {
+pub fn parse_ipset_list_output(output: &str) -> Option<SetInfo> {
     let mut info = SetInfo::default();
 
     for line in output.lines() {
@@ -225,19 +225,34 @@ pub fn rules_active(set_name: &str) -> bool {
         .output()
         .ok();
 
-    if let Some(output) = output {
-        if output.status.success() {
+    match output {
+        Some(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Check for our catch-all blackhole rule
-            if !stdout.contains(&format!("lookup {}", BLACKHOLE_TABLE)) {
-                return false;
-            }
-            // Also verify the whitelist rule exists
-            return stdout.contains(&format!("match-set={}", set_name));
+            check_rules_in_output(&stdout, set_name)
         }
+        _ => false,
     }
+}
 
-    false
+/// Parse `ip rule list` output and check if banip rules are present.
+/// Extracted for testability.
+pub fn check_rules_in_output(output: &str, set_name: &str) -> bool {
+    // Check for catch-all blackhole rule
+    if !output.contains(&format!("lookup {}", BLACKHOLE_TABLE)) {
+        return false;
+    }
+    // Check for whitelist rule
+    output.contains(&format!("match-set={}", set_name))
+}
+
+/// Parse `ip rule list` output and check for blackhole rule only.
+pub fn has_blackhole_rule(output: &str) -> bool {
+    output.contains(&format!("lookup {}", BLACKHOLE_TABLE))
+}
+
+/// Parse `ip rule list` output and check for match-set whitelist rule only.
+pub fn has_whitelist_rule(output: &str, set_name: &str) -> bool {
+    output.contains(&format!("match-set={}", set_name))
 }
 
 /// Ensure the blackhole routing table is configured.
@@ -289,8 +304,10 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    // ─── generate_ipset_restore ─────────────────────────────────────
+
     #[test]
-    fn test_generate_script() {
+    fn test_generate_script_basic() {
         let cidrs = vec![
             Ipv4Net::new(Ipv4Addr::new(1, 0, 1, 0), 24).unwrap(),
             Ipv4Net::new(Ipv4Addr::new(1, 0, 2, 0), 23).unwrap(),
@@ -303,7 +320,55 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ipset_list_output() {
+    fn test_generate_script_custom_set_name() {
+        let cidrs = vec![
+            Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 8).unwrap(),
+        ];
+        let script = generate_ipset_restore("my_whitelist", &cidrs);
+        assert!(script.contains("create my_whitelist hash:net"));
+        assert!(script.contains("add my_whitelist 10.0.0.0/8"));
+    }
+
+    #[test]
+    fn test_generate_script_empty_cidrs() {
+        let script = generate_ipset_restore("banip", &[]);
+        assert!(script.contains("create banip hash:net"));
+        assert!(!script.contains("add "));
+    }
+
+    #[test]
+    fn test_generate_script_single_entry() {
+        let cidrs = vec![
+            Ipv4Net::new(Ipv4Addr::new(192, 168, 1, 0), 24).unwrap(),
+        ];
+        let script = generate_ipset_restore("banip", &cidrs);
+        let lines: Vec<&str> = script.lines().collect();
+        // Should have exactly 2 lines: create + add
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn test_generate_script_many_entries() {
+        let cidrs: Vec<Ipv4Net> = (0..100)
+            .map(|i| Ipv4Net::new(Ipv4Addr::new(i, 0, 0, 0), 8).unwrap())
+            .collect();
+        let script = generate_ipset_restore("banip", &cidrs);
+        // 1 create line + 100 add lines = 101 lines
+        assert_eq!(script.lines().count(), 101);
+    }
+
+    #[test]
+    fn test_generate_script_contains_hashsize_maxelem() {
+        let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
+        let script = generate_ipset_restore("banip", &cidrs);
+        assert!(script.contains("hashsize 65536"));
+        assert!(script.contains("maxelem 131072"));
+    }
+
+    // ─── parse_ipset_list_output ────────────────────────────────────
+
+    #[test]
+    fn test_parse_ipset_list_full() {
         let output = r#"Name: banip
 Type: hash:net
 Revision: 7
@@ -318,5 +383,149 @@ Members:
         assert_eq!(info.typ, "hash:net");
         assert_eq!(info.elements, 8200);
         assert_eq!(info.references, 2);
+    }
+
+    #[test]
+    fn test_parse_ipset_list_zero_entries() {
+        let output = r#"Name: banip
+Type: hash:net
+Revision: 7
+Header: family inet hashsize 65536 maxelem 131072
+Size in memory: 1024
+References: 0
+Number of entries: 0
+Members:
+"#;
+        let info = parse_ipset_list_output(output).unwrap();
+        assert_eq!(info.elements, 0);
+        assert_eq!(info.references, 0);
+    }
+
+    #[test]
+    fn test_parse_ipset_list_large_entries() {
+        let output = r#"Name: banip
+Type: hash:net
+Revision: 7
+Header: family inet hashsize 65536 maxelem 131072
+Size in memory: 2097152
+References: 1
+Number of entries: 1234567
+Members:
+"#;
+        let info = parse_ipset_list_output(output).unwrap();
+        assert_eq!(info.elements, 1_234_567);
+    }
+
+    #[test]
+    fn test_parse_ipset_list_no_members_section() {
+        // Edge case: output truncated before Members
+        let output = r#"Name: banip
+Type: hash:net
+Revision: 7
+Header: family inet hashsize 65536 maxelem 131072
+Number of entries: 100
+"#;
+        let info = parse_ipset_list_output(output).unwrap();
+        assert_eq!(info.elements, 100);
+    }
+
+    #[test]
+    fn test_parse_ipset_list_empty_input() {
+        let info = parse_ipset_list_output("");
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn test_parse_ipset_list_garbage_input() {
+        let info = parse_ipset_list_output("not an ipset listing");
+        assert!(info.is_none());
+    }
+
+    // ─── check_rules_in_output (ip rule list parsing) ───────────────
+
+    #[test]
+    fn test_check_rules_both_present() {
+        let output = format!(
+            "32765: from 0.0.0.0/0 lookup {}\n10000: match-set=banip lookup main\n",
+            BLACKHOLE_TABLE
+        );
+        assert!(check_rules_in_output(&output, "banip"));
+    }
+
+    #[test]
+    fn test_check_rules_only_blackhole() {
+        let output = format!(
+            "32765: from 0.0.0.0/0 lookup {}\n",
+            BLACKHOLE_TABLE
+        );
+        assert!(!check_rules_in_output(&output, "banip"));
+    }
+
+    #[test]
+    fn test_check_rules_only_whitelist() {
+        let output = "10000: match-set=banip lookup main\n";
+        assert!(!check_rules_in_output(&output, "banip"));
+    }
+
+    #[test]
+    fn test_check_rules_neither_present() {
+        assert!(!check_rules_in_output("0: from all lookup local\n", "banip"));
+    }
+
+    #[test]
+    fn test_check_rules_different_set_name() {
+        let output = format!(
+            "32765: from 0.0.0.0/0 lookup {}\n10000: match-set=other_set lookup main\n",
+            BLACKHOLE_TABLE
+        );
+        assert!(!check_rules_in_output(&output, "banip"));
+    }
+
+    #[test]
+    fn test_check_rules_empty_output() {
+        assert!(!check_rules_in_output("", "banip"));
+    }
+
+    #[test]
+    fn test_has_blackhole_rule_present() {
+        let output = format!("32765: from 0.0.0.0/0 lookup {}\n", BLACKHOLE_TABLE);
+        assert!(has_blackhole_rule(&output));
+    }
+
+    #[test]
+    fn test_has_blackhole_rule_absent() {
+        assert!(!has_blackhole_rule("32766: from all lookup main\n"));
+    }
+
+    #[test]
+    fn test_has_whitelist_rule_present() {
+        assert!(has_whitelist_rule("10000: match-set=banip lookup main\n", "banip"));
+    }
+
+    #[test]
+    fn test_has_whitelist_rule_absent() {
+        assert!(!has_whitelist_rule("32766: from all lookup main\n", "banip"));
+    }
+
+    #[test]
+    fn test_has_whitelist_rule_wrong_name() {
+        assert!(!has_whitelist_rule("10000: match-set=other lookup main\n", "banip"));
+    }
+
+    // ─── constants ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_blackhole_table_number() {
+        assert_eq!(BLACKHOLE_TABLE, 100);
+    }
+
+    #[test]
+    fn test_route_priority() {
+        assert_eq!(ROUTE_PRIO, 10000);
+    }
+
+    #[test]
+    fn test_blackhole_table_name() {
+        assert_eq!(BLACKHOLE_TABLE_NAME, "banip_blackhole");
     }
 }

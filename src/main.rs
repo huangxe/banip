@@ -271,3 +271,172 @@ fn format_number(n: u64) -> String {
         format!("{}", n)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    // ─── CLI parsing: subcommands ───────────────────────────────────
+
+    #[test]
+    fn test_cli_update() {
+        let cli = Cli::parse_from(["banip", "update"]);
+        match cli.command {
+            Commands::Update { url } => assert!(url.is_none()),
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_update_with_url() {
+        let cli = Cli::parse_from(["banip", "update", "--url", "https://example.com/ips.txt"]);
+        match cli.command {
+            Commands::Update { url } => assert_eq!(url.unwrap(), "https://example.com/ips.txt"),
+            _ => panic!("expected Update command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_enable() {
+        let cli = Cli::parse_from(["banip", "enable"]);
+        match cli.command {
+            Commands::Enable => {}
+            _ => panic!("expected Enable command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_disable() {
+        let cli = Cli::parse_from(["banip", "disable"]);
+        match cli.command {
+            Commands::Disable => {}
+            _ => panic!("expected Disable command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_state() {
+        let cli = Cli::parse_from(["banip", "state"]);
+        match cli.command {
+            Commands::State => {}
+            _ => panic!("expected State command"),
+        }
+    }
+
+    // ─── CLI parsing: global options ────────────────────────────────
+
+    #[test]
+    fn test_cli_default_set_name() {
+        let cli = Cli::parse_from(["banip", "state"]);
+        assert_eq!(cli.set, SET_NAME);
+    }
+
+    #[test]
+    fn test_cli_custom_set_name() {
+        let cli = Cli::parse_from(["banip", "-s", "my_whitelist", "state"]);
+        assert_eq!(cli.set, "my_whitelist");
+    }
+
+    #[test]
+    fn test_cli_custom_set_name_long() {
+        let cli = Cli::parse_from(["banip", "--set", "custom_set", "state"]);
+        assert_eq!(cli.set, "custom_set");
+    }
+
+    #[test]
+    fn test_cli_default_dir() {
+        let cli = Cli::parse_from(["banip", "state"]);
+        assert_eq!(cli.dir, DATA_DIR);
+    }
+
+    #[test]
+    fn test_cli_custom_dir() {
+        let cli = Cli::parse_from(["banip", "-d", "/tmp/banip", "state"]);
+        assert_eq!(cli.dir, "/tmp/banip");
+    }
+
+    #[test]
+    fn test_cli_custom_dir_long() {
+        let cli = Cli::parse_from(["banip", "--dir", "/opt/banip", "state"]);
+        assert_eq!(cli.dir, "/opt/banip");
+    }
+
+    #[test]
+    fn test_cli_update_with_custom_dir_and_set() {
+        let cli = Cli::parse_from(["banip", "-s", "test", "-d", "/tmp/test", "update"]);
+        assert_eq!(cli.set, "test");
+        assert_eq!(cli.dir, "/tmp/test");
+    }
+
+    // ─── format_number ──────────────────────────────────────────────
+
+    #[test]
+    fn test_format_number_zero() {
+        assert_eq!(format_number(0), "0");
+    }
+
+    #[test]
+    fn test_format_number_small() {
+        assert_eq!(format_number(1), "1");
+        assert_eq!(format_number(99), "99");
+        assert_eq!(format_number(999), "999");
+    }
+
+    #[test]
+    fn test_format_number_kilo() {
+        assert_eq!(format_number(1_000), "1.00K");
+        assert_eq!(format_number(1_500), "1.50K");
+        assert_eq!(format_number(999_999), "1000.00K");
+    }
+
+    #[test]
+    fn test_format_number_mega() {
+        assert_eq!(format_number(1_000_000), "1.00M");
+        assert_eq!(format_number(50_000_000), "50.00M");
+        assert_eq!(format_number(999_999_999), "1000.00M");
+    }
+
+    #[test]
+    fn test_format_number_giga() {
+        assert_eq!(format_number(1_000_000_000), "1.00B");
+        assert_eq!(format_number(4_294_967_296), "4.29B"); // Total IPv4
+    }
+
+    // ─── constants ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(SET_NAME, "banip");
+        assert_eq!(DATA_DIR, "/var/lib/banip");
+        assert_eq!(CIDR_FILE, "cn_ip_cidr.txt");
+    }
+
+    // ─── integration: update logic with cidr + state ────────────────
+
+    #[test]
+    fn test_update_logic_parse_and_save() {
+        // Simulate what cmd_update does with CIDR data
+        let mock_cidr_content = "1.0.1.0/24\n1.0.2.0/23\n10.0.0.0/8\n";
+        let cidrs = cidr::parse_cidr_list(mock_cidr_content);
+        assert_eq!(cidrs.len(), 3);
+
+        let total_ips: u64 = cidrs.iter().map(|c| c.hosts().count() as u64).sum();
+        assert!(total_ips > 0);
+
+        // Verify format_number works with the count
+        let formatted = format_number(cidrs.len() as u64);
+        assert!(!formatted.is_empty());
+    }
+
+    #[test]
+    fn test_update_logic_download_validate_flow() {
+        // Verify download module validates content correctly
+        let mock_content = "1.0.1.0/24\n1.0.2.0/23\n# comment\n\n";
+        let valid_count = download::validate_cidr_content(mock_content);
+        assert_eq!(valid_count, 2);
+
+        let cidrs = cidr::parse_cidr_list(mock_content);
+        assert_eq!(cidrs.len(), 2);
+    }
+}
