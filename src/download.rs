@@ -2,10 +2,11 @@ use std::io::Write;
 
 /// Default URL for downloading China IP CIDR list.
 pub const DEFAULT_CN_IP_URL: &str =
-    "https://raw.githubusercontent.com/isxpy/China-ip-range/main/cnip_cidr.txt";
+    "https://ghfast.top/https://raw.githubusercontent.com/isxpy/China-ip-range/main/cnip_cidr.txt";
 
 /// Alternative URLs in case the primary one fails.
 const FALLBACK_URLS: &[&str] = &[
+    "https://ghfast.top/https://raw.githubusercontent.com/isxpy/China-ip-range/main/cnip_cidr.txt",
     "https://raw.githubusercontent.com/isxpy/China-ip-range/main/cnip_cidr.txt",
     "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt",
 ];
@@ -121,7 +122,7 @@ mod tests {
 
     #[test]
     fn test_fallback_urls_count() {
-        assert_eq!(FALLBACK_URLS.len(), 2);
+        assert_eq!(FALLBACK_URLS.len(), 3);
     }
 
     #[test]

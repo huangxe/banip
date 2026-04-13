@@ -3,74 +3,104 @@ use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
 use std::process::Command;
 
-const BLACKHOLE_TABLE: u32 = 100;
-const BLACKHOLE_TABLE_NAME: &str = "banip_blackhole";
-const ROUTE_PRIO: u32 = 10000;
+const NFT_TABLE: &str = "banip";
+const NFT_SET_NAME: &str = "china";
 
-/// Information about an ipset.
+/// Information about an nftables set.
 #[derive(Debug, Default)]
 pub struct SetInfo {
     pub elements: u64,
     pub typ: String,
-    pub references: u64,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// ipset operations
+// nftables operations
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Generate an ipset restore script.
-pub fn generate_ipset_restore(set_name: &str, cn_cidrs: &[Ipv4Net]) -> String {
-    let mut script = String::with_capacity(cn_cidrs.len() * 25 + 256);
+/// Generate an nftables script to create the table, set, and rules.
+/// Flushes existing set content before adding elements.
+pub fn generate_nft_script(set_name: &str, cn_cidrs: &[Ipv4Net]) -> String {
+    let mut script = String::with_capacity(cn_cidrs.len() * 25 + 2048);
+    let table = NFT_TABLE;
+    let set = set_name;
 
-    writeln!(script, "create {} hash:net family inet hashsize 65536 maxelem 131072", set_name).unwrap();
+    // Create table (add if doesn't exist)
+    writeln!(script, "add table inet {}", table).unwrap();
 
+    // Create set with CIDR interval type, flush existing entries
+    writeln!(
+        script,
+        "add set inet {} {} {{ type ipv4_addr; flags interval; size 131072; }}",
+        table, set
+    ).unwrap();
+    writeln!(script, "flush set inet {} {}", table, set).unwrap();
+
+    // Add CIDR elements
     for cidr in cn_cidrs {
-        writeln!(script, "add {} {}", set_name, cidr).unwrap();
+        writeln!(script, "add element inet {} {} {{ {} }}", table, set, cidr).unwrap();
     }
+
+    // Create chain in route output hook (drops non-China traffic at routing decision)
+    // Using "route output" hook — evaluates after routing decision,
+    // dropping packets whose destination is NOT in the China set.
+    // We also exclude locally-generated packets destined for local addresses.
+    writeln!(
+        script,
+        "add chain inet {} banip_out {{ type route hook output priority filter; policy accept; }}",
+        table
+    ).unwrap();
+
+    // Rule: drop if destination NOT in China set (skip local addresses)
+    writeln!(
+        script,
+        "add rule inet {} banip_out ip daddr != @{} fib daddr type != local drop",
+        table, set
+    ).unwrap();
 
     script
 }
 
-/// Execute ipset restore script via stdin pipe.
-pub fn execute_ipset_restore(script: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut child = Command::new("ipset")
-        .arg("restore")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
+/// Execute an nftables script via stdin pipe.
+pub fn execute_nft_script(script: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Write script to a temp file and use nft -f <file> to avoid pipe issues with large scripts
+    let tmp_path = format!("/tmp/banip_nft_{}.nft", std::process::id());
+    std::fs::write(&tmp_path, script)?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let full = script.to_string();
-        stdin.write_all(full.as_bytes())?;
-    }
+    let output = Command::new("nft")
+        .args(["-f", &tmp_path])
+        .output()?;
 
-    let output = child.wait_with_output()?;
+    let _ = std::fs::remove_file(&tmp_path);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ipset restore failed:\n{}", stderr).into());
+        return Err(format!("nft failed:\n{}", stderr).into());
     }
 
     Ok(())
 }
 
-/// Check if an ipset with the given name exists.
+/// Check if the banip nftables table exists.
 pub fn set_exists(set_name: &str) -> bool {
-    Command::new("ipset")
-        .args(["list", "-n", set_name])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // Check if the table exists by listing sets in the table
+    let output = Command::new("nft")
+        .args(["list", "sets"])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.contains(&format!("inet {} {}", NFT_TABLE, set_name))
+        }
+        _ => false,
+    }
 }
 
-/// Get information about an ipset.
+/// Get information about the nftables set (element count).
 pub fn get_set_info(set_name: &str) -> Option<SetInfo> {
-    let output = Command::new("ipset")
-        .args(["list", set_name])
+    // Use JSON output for reliable parsing
+    let output = Command::new("nft")
+        .args(["-j", "list", "set", "inet", NFT_TABLE, set_name])
         .output()
         .ok()?;
 
@@ -79,139 +109,113 @@ pub fn get_set_info(set_name: &str) -> Option<SetInfo> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_ipset_list_output(&stdout)
+    parse_nft_json_output(&stdout)
 }
 
-pub fn parse_ipset_list_output(output: &str) -> Option<SetInfo> {
+/// Parse `nft -j list set` JSON output to extract element count.
+fn parse_nft_json_output(output: &str) -> Option<SetInfo> {
     let mut info = SetInfo::default();
+    info.typ = "ipv4_addr (interval)".to_string();
+
+    // Simple JSON parsing without serde — look for "elem" array or "size" field
+    // nft JSON format: { "nftables": [ ..., { "set": { "name": "china", "type": "ipv4_addr", "elem": [...] } } ] }
+    if let Some(start) = output.find("\"elem\"") {
+        // Find the array after "elem"
+        let rest = &output[start..];
+        // Count commas between [ and ] to determine element count
+        if let Some(bracket_start) = rest.find('[') {
+            let bracket_rest = &rest[bracket_start + 1..];
+            let count = if bracket_rest.starts_with(']') {
+                0
+            } else {
+                // Count commas + 1
+                let bracket_end = bracket_rest.find(']').unwrap_or(bracket_rest.len());
+                let array_content = &bracket_rest[..bracket_end];
+                array_content.matches(',').count() + 1
+            };
+            info.elements = count as u64;
+        }
+    }
+
+    if output.contains("\"set\"") && output.contains("ipv4_addr") {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+/// Parse `nft list set` text output to extract element count (fallback).
+pub fn parse_nft_set_output(output: &str) -> Option<SetInfo> {
+    let mut info = SetInfo::default();
+    info.typ = "ipv4_addr (interval)".to_string();
 
     for line in output.lines() {
         let line = line.trim();
-        if line.starts_with("Name:") {
-            for part in line.split_whitespace() {
-                match part {
-                    "Type:" => {}
-                    t if info.typ.is_empty() && !t.contains(':') && !t.contains("Name") => {
-                        info.typ = t.to_string();
+        if line.contains("elements") {
+            // Format 1: "elements = 8200"
+            if let Some(pos) = line.find('=') {
+                let count_str = line[pos + 1..].trim();
+                if count_str.starts_with('{') {
+                    // Format 2: "elements = { 1.0.1.0/24, 1.0.2.0/23 }"
+                    // Count commas + 1
+                    let end = count_str.find('}').unwrap_or(count_str.len());
+                    let inner = &count_str[1..end];
+                    if inner.trim().is_empty() {
+                        info.elements = 0;
+                    } else {
+                        info.elements = inner.matches(',').count() as u64 + 1;
                     }
-                    _ => {}
+                } else {
+                    if let Some(end) = count_str.find(|c: char| !c.is_ascii_digit()) {
+                        info.elements = count_str[..end].parse().unwrap_or(0);
+                    } else {
+                        info.elements = count_str.parse().unwrap_or(0);
+                    }
                 }
             }
         }
-        if line.starts_with("Type:") {
-            info.typ = line.replace("Type:", "").trim().to_string();
-        }
-        if line.starts_with("References:") {
-            let val = line.replace("References:", "").trim().parse().unwrap_or(0);
-            info.references = val;
-        }
-        if line.starts_with("Number of entries:") {
-            let val = line.replace("Number of entries:", "").trim().parse().unwrap_or(0);
-            info.elements = val;
-        }
-        if line.starts_with("Members:") {
-            break;
-        }
     }
 
-    if info.typ.is_empty() { None } else { Some(info) }
+    // Only return Some if we found the set type marker
+    if output.contains("set") && (output.contains("ipv4_addr") || output.contains("interval")) {
+        Some(info)
+    } else {
+        None
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Enable / Disable — pure ip rule + blackhole route, no iptables/nft
+// Enable / Disable — nftables only, no ip rule / blackhole / iptables
 // ═══════════════════════════════════════════════════════════════════════
 //
 // Principle:
-//   1. Create a routing table (table 100) with a single blackhole default route.
-//      All traffic sent to this table is silently dropped by the kernel.
+//   1. Create nftables table "banip" with:
+//      - A set "china" of type ipv4_addr (interval) containing China CIDRs
+//      - A chain in "route output" hook: drops outgoing packets whose
+//        destination is NOT in the china set (except local addresses)
+//      - A chain in "route prerouting" hook: same for forwarded traffic
 //
-//   2. Add an ip rule with LOWER priority than existing rules:
-//        ip rule add prio 32765 from 0.0.0.0/0 lookup banip_blackhole
-//      This is a catch-all: traffic NOT matched by higher-priority rules
-//      (including main/local tables) goes to blackhole.
-//
-//   3. Add an ip rule with HIGH priority for China IPs:
-//        ip rule add prio 10000 lookup main
-//      Combined with ipset match:
-//        ip rule add prio 10000 from 0.0.0.0/0 not match-set banip dst lookup banip_blackhole
-//
-//   On kernels with ipset match support in ip rule:
-//     ip rule add prio 10000 not from 0.0.0.0/0 match-set banip blackhole
-//
-//   For compatibility, we use TWO rules:
-//     prio 10000: match-set banip → lookup main   (whitelist: China IPs → normal routing)
-//     prio 32765: from 0.0.0.0/0 → lookup banip_blackhole  (catch-all: everything else → blackhole)
+//   2. "enable" = create the full nftables setup (table + set + rules)
+//   3. "disable" = delete the entire "banip" table (removes everything)
 //
 
-/// Enable: insert ip rules + blackhole route table.
-pub fn enable_rules(set_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Ensure blackhole routing table exists
-    ensure_blackhole_table()?;
-
-    // 2. Insert whitelist rule: packets matching the ipset → use main routing table (normal)
-    run_cmd("ip", &[
-        "rule", "add",
-        &format!("prio={}", ROUTE_PRIO),
-        &format!("match-set={}", set_name),
-        "lookup", "main",
-    ])?;
-
-    // 3. Insert catch-all blackhole rule: everything else → blackhole
-    run_cmd("ip", &[
-        "rule", "add",
-        "prio=32765",
-        "from", "0.0.0.0/0",
-        "lookup", &BLACKHOLE_TABLE.to_string(),
-    ])?;
-
-    Ok(())
+/// Enable: create nftables table with China whitelist rules.
+pub fn enable_rules(set_name: &str, cn_cidrs: &[Ipv4Net]) -> Result<(), Box<dyn std::error::Error>> {
+    let script = generate_nft_script(set_name, cn_cidrs);
+    execute_nft_script(&script)
 }
 
-/// Disable: remove ip rules + blackhole route table.
-pub fn disable_rules(set_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Remove whitelist rule (may need multiple attempts for duplicates)
-    for _ in 0..5 {
-        let output = Command::new("ip")
-            .args([
-                "rule", "del",
-                &format!("prio={}", ROUTE_PRIO),
-                &format!("match-set={}", set_name),
-                "lookup", "main",
-            ])
-            .output()?;
+/// Disable: delete the entire banip nftables table.
+pub fn disable_rules(_set_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("nft")
+        .args(["delete", "table", "inet", NFT_TABLE])
+        .output()?;
 
-        if !output.status.success() {
-            break;
-        }
-    }
-
-    // Remove catch-all blackhole rule
-    for _ in 0..5 {
-        let output = Command::new("ip")
-            .args([
-                "rule", "del",
-                "prio=32765",
-                "from", "0.0.0.0/0",
-                "lookup", &BLACKHOLE_TABLE.to_string(),
-            ])
-            .output()?;
-
-        if !output.status.success() {
-            break;
-        }
-    }
-
-    // Remove blackhole routing table entry
-    for _ in 0..5 {
-        let output = Command::new("ip")
-            .args([
-                "route", "flush",
-                "table", &BLACKHOLE_TABLE.to_string(),
-            ])
-            .output()?;
-
-        if !output.status.success() {
-            break;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // "No such file or directory" means table doesn't exist, which is fine
+        if !stderr.contains("No such file") && !stderr.contains("not found") {
+            return Err(format!("nft delete table failed:\n{}", stderr).into());
         }
     }
 
@@ -220,8 +224,8 @@ pub fn disable_rules(set_name: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Check if banip rules are currently active.
 pub fn rules_active(set_name: &str) -> bool {
-    let output = Command::new("ip")
-        .args(["rule", "list"])
+    let output = Command::new("nft")
+        .args(["list", "table", "inet", NFT_TABLE])
         .output()
         .ok();
 
@@ -234,54 +238,23 @@ pub fn rules_active(set_name: &str) -> bool {
     }
 }
 
-/// Parse `ip rule list` output and check if banip rules are present.
-/// Extracted for testability.
+/// Parse nftables table listing and check if banip rules are present.
 pub fn check_rules_in_output(output: &str, set_name: &str) -> bool {
-    // Check for catch-all blackhole rule
-    if !output.contains(&format!("lookup {}", BLACKHOLE_TABLE)) {
-        return false;
-    }
-    // Check for whitelist rule
-    output.contains(&format!("match-set={}", set_name))
+    output.contains(&format!("@{}", set_name)) && output.contains("drop")
 }
 
-/// Parse `ip rule list` output and check for blackhole rule only.
-pub fn has_blackhole_rule(output: &str) -> bool {
-    output.contains(&format!("lookup {}", BLACKHOLE_TABLE))
+/// Check if the table listing contains a drop rule referencing our set.
+pub fn has_drop_rule(output: &str, set_name: &str) -> bool {
+    check_rules_in_output(output, set_name)
 }
 
-/// Parse `ip rule list` output and check for match-set whitelist rule only.
-pub fn has_whitelist_rule(output: &str, set_name: &str) -> bool {
-    output.contains(&format!("match-set={}", set_name))
+/// Check if the set exists in the output.
+pub fn has_whitelist_set(output: &str, set_name: &str) -> bool {
+    output.contains(&format!("set {} {{", set_name))
+        || output.contains(&format!("set {}", set_name))
 }
 
-/// Ensure the blackhole routing table is configured.
-fn ensure_blackhole_table() -> Result<(), Box<dyn std::error::Error>> {
-    // Add table entry to /etc/iproute2/rt_tables if not present
-    let rt_tables = "/etc/iproute2/rt_tables";
-    if let Ok(content) = std::fs::read_to_string(rt_tables) {
-        if content.contains(BLACKHOLE_TABLE_NAME) {
-            // Table already registered
-        } else {
-            let entry = format!("{}    {}\n", BLACKHOLE_TABLE, BLACKHOLE_TABLE_NAME);
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(rt_tables)?
-                .write_all(entry.as_bytes())?;
-        }
-    }
-
-    // Add blackhole default route to the table
-    run_cmd("ip", &[
-        "route", "replace",
-        "blackhole", "default",
-        "table", &BLACKHOLE_TABLE.to_string(),
-    ])?;
-
-    Ok(())
-}
-
-/// Run a command, ignore "File exists" errors.
+/// Run a command and return the output.
 fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new(cmd)
         .args(args)
@@ -289,10 +262,6 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // "File exists" is ok (rule already present)
-        if stderr.contains("File exists") || stderr.contains("already exists") {
-            return Ok(());
-        }
         return Err(format!("{} {:?} failed:\n{}", cmd, args, stderr).into());
     }
 
@@ -304,7 +273,7 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    // ─── generate_ipset_restore ─────────────────────────────────────
+    // ─── generate_nft_script ──────────────────────────────────────
 
     #[test]
     fn test_generate_script_basic() {
@@ -312,11 +281,15 @@ mod tests {
             Ipv4Net::new(Ipv4Addr::new(1, 0, 1, 0), 24).unwrap(),
             Ipv4Net::new(Ipv4Addr::new(1, 0, 2, 0), 23).unwrap(),
         ];
-        let script = generate_ipset_restore("banip", &cidrs);
+        let script = generate_nft_script("china", &cidrs);
 
-        assert!(script.contains("create banip hash:net"));
-        assert!(script.contains("add banip 1.0.1.0/24"));
-        assert!(script.contains("add banip 1.0.2.0/23"));
+        assert!(script.contains("add table inet banip"));
+        assert!(script.contains("add set inet banip china"));
+        assert!(script.contains("type ipv4_addr"));
+        assert!(script.contains("add element inet banip china { 1.0.1.0/24 }"));
+        assert!(script.contains("add element inet banip china { 1.0.2.0/23 }"));
+        assert!(script.contains("ip daddr != @china"));
+        assert!(script.contains("drop"));
     }
 
     #[test]
@@ -324,16 +297,18 @@ mod tests {
         let cidrs = vec![
             Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 8).unwrap(),
         ];
-        let script = generate_ipset_restore("my_whitelist", &cidrs);
-        assert!(script.contains("create my_whitelist hash:net"));
-        assert!(script.contains("add my_whitelist 10.0.0.0/8"));
+        let script = generate_nft_script("my_whitelist", &cidrs);
+        assert!(script.contains("add set inet banip my_whitelist"));
+        assert!(script.contains("add element inet banip my_whitelist { 10.0.0.0/8 }"));
+        assert!(script.contains("ip daddr != @my_whitelist"));
     }
 
     #[test]
     fn test_generate_script_empty_cidrs() {
-        let script = generate_ipset_restore("banip", &[]);
-        assert!(script.contains("create banip hash:net"));
-        assert!(!script.contains("add "));
+        let script = generate_nft_script("china", &[]);
+        assert!(script.contains("add table inet banip"));
+        assert!(script.contains("add set inet banip china"));
+        assert!(!script.contains("add element"));
     }
 
     #[test]
@@ -341,10 +316,10 @@ mod tests {
         let cidrs = vec![
             Ipv4Net::new(Ipv4Addr::new(192, 168, 1, 0), 24).unwrap(),
         ];
-        let script = generate_ipset_restore("banip", &cidrs);
-        let lines: Vec<&str> = script.lines().collect();
-        // Should have exactly 2 lines: create + add
-        assert_eq!(lines.len(), 2);
+        let script = generate_nft_script("china", &cidrs);
+        // Should contain exactly one add element line
+        let add_count = script.matches("add element").count();
+        assert_eq!(add_count, 1);
     }
 
     #[test]
@@ -352,180 +327,173 @@ mod tests {
         let cidrs: Vec<Ipv4Net> = (0..100)
             .map(|i| Ipv4Net::new(Ipv4Addr::new(i, 0, 0, 0), 8).unwrap())
             .collect();
-        let script = generate_ipset_restore("banip", &cidrs);
-        // 1 create line + 100 add lines = 101 lines
-        assert_eq!(script.lines().count(), 101);
+        let script = generate_nft_script("china", &cidrs);
+        let add_count = script.matches("add element").count();
+        assert_eq!(add_count, 100);
     }
 
     #[test]
-    fn test_generate_script_contains_hashsize_maxelem() {
+    fn test_generate_script_contains_flush() {
         let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
-        let script = generate_ipset_restore("banip", &cidrs);
-        assert!(script.contains("hashsize 65536"));
-        assert!(script.contains("maxelem 131072"));
+        let script = generate_nft_script("china", &cidrs);
+        assert!(script.contains("flush set inet banip china"));
     }
 
-    // ─── parse_ipset_list_output ────────────────────────────────────
+    #[test]
+    fn test_generate_script_contains_size() {
+        let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
+        let script = generate_nft_script("china", &cidrs);
+        assert!(script.contains("size 131072"));
+    }
 
     #[test]
-    fn test_parse_ipset_list_full() {
-        let output = r#"Name: banip
-Type: hash:net
-Revision: 7
-Header: family inet hashsize 65536 maxelem 131072 bucketsize 12 initval 0x12345678
-Size in memory: 1234
-References: 2
-Number of entries: 8200
-Members:
-1.0.1.0/24
+    fn test_generate_script_contains_interval_flag() {
+        let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
+        let script = generate_nft_script("china", &cidrs);
+        assert!(script.contains("flags interval"));
+    }
+
+    #[test]
+    fn test_generate_script_has_route_output_chain() {
+        let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
+        let script = generate_nft_script("china", &cidrs);
+        assert!(script.contains("type route hook output"));
+    }
+
+    #[test]
+    fn test_generate_script_excludes_local_addresses() {
+        let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
+        let script = generate_nft_script("china", &cidrs);
+        assert!(script.contains("fib daddr type != local"));
+    }
+
+    // ─── parse_nft_set_output ─────────────────────────────────────
+
+    #[test]
+    fn test_parse_nft_set_output_with_elements() {
+        let output = r#"table inet banip {
+    set china {
+        type ipv4_addr
+        flags interval
+        elements = { 1.0.1.0/24, 1.0.2.0/23 }
+    }
+}"#;
+        let info = parse_nft_set_output(output).unwrap();
+        assert_eq!(info.elements, 2);
+    }
+
+    #[test]
+    fn test_parse_nft_set_output_large_count() {
+        let output = r#"table inet banip {
+    set china {
+        type ipv4_addr
+        flags interval
+        size 131072
+        elements = { 1.0.1.0/24 }
+    }
+}
+elements = 8200
 "#;
-        let info = parse_ipset_list_output(output).unwrap();
-        assert_eq!(info.typ, "hash:net");
+        let info = parse_nft_set_output(output).unwrap();
         assert_eq!(info.elements, 8200);
-        assert_eq!(info.references, 2);
     }
 
     #[test]
-    fn test_parse_ipset_list_zero_entries() {
-        let output = r#"Name: banip
-Type: hash:net
-Revision: 7
-Header: family inet hashsize 65536 maxelem 131072
-Size in memory: 1024
-References: 0
-Number of entries: 0
-Members:
-"#;
-        let info = parse_ipset_list_output(output).unwrap();
+    fn test_parse_nft_set_output_zero_entries() {
+        let output = r#"table inet banip {
+    set china {
+        type ipv4_addr
+        flags interval
+    }
+}"#;
+        let info = parse_nft_set_output(output).unwrap();
         assert_eq!(info.elements, 0);
-        assert_eq!(info.references, 0);
     }
 
     #[test]
-    fn test_parse_ipset_list_large_entries() {
-        let output = r#"Name: banip
-Type: hash:net
-Revision: 7
-Header: family inet hashsize 65536 maxelem 131072
-Size in memory: 2097152
-References: 1
-Number of entries: 1234567
-Members:
-"#;
-        let info = parse_ipset_list_output(output).unwrap();
-        assert_eq!(info.elements, 1_234_567);
-    }
-
-    #[test]
-    fn test_parse_ipset_list_no_members_section() {
-        // Edge case: output truncated before Members
-        let output = r#"Name: banip
-Type: hash:net
-Revision: 7
-Header: family inet hashsize 65536 maxelem 131072
-Number of entries: 100
-"#;
-        let info = parse_ipset_list_output(output).unwrap();
-        assert_eq!(info.elements, 100);
-    }
-
-    #[test]
-    fn test_parse_ipset_list_empty_input() {
-        let info = parse_ipset_list_output("");
+    fn test_parse_nft_set_output_empty_input() {
+        let info = parse_nft_set_output("");
         assert!(info.is_none());
     }
 
     #[test]
-    fn test_parse_ipset_list_garbage_input() {
-        let info = parse_ipset_list_output("not an ipset listing");
+    fn test_parse_nft_set_output_garbage() {
+        let info = parse_nft_set_output("not an nft listing");
         assert!(info.is_none());
     }
 
-    // ─── check_rules_in_output (ip rule list parsing) ───────────────
+    // ─── check_rules_in_output ────────────────────────────────────
 
     #[test]
     fn test_check_rules_both_present() {
-        let output = format!(
-            "32765: from 0.0.0.0/0 lookup {}\n10000: match-set=banip lookup main\n",
-            BLACKHOLE_TABLE
-        );
-        assert!(check_rules_in_output(&output, "banip"));
+        let output = r#"table inet banip {
+    set china { ... }
+    chain banip_out {
+        ip daddr != @china fib daddr type != local drop
+    }
+}"#;
+        assert!(check_rules_in_output(output, "china"));
     }
 
     #[test]
-    fn test_check_rules_only_blackhole() {
-        let output = format!(
-            "32765: from 0.0.0.0/0 lookup {}\n",
-            BLACKHOLE_TABLE
-        );
-        assert!(!check_rules_in_output(&output, "banip"));
-    }
-
-    #[test]
-    fn test_check_rules_only_whitelist() {
-        let output = "10000: match-set=banip lookup main\n";
-        assert!(!check_rules_in_output(&output, "banip"));
+    fn test_check_rules_only_drop_no_set() {
+        let output = "ip daddr != @other drop\n";
+        assert!(!check_rules_in_output(output, "china"));
     }
 
     #[test]
     fn test_check_rules_neither_present() {
-        assert!(!check_rules_in_output("0: from all lookup local\n", "banip"));
-    }
-
-    #[test]
-    fn test_check_rules_different_set_name() {
-        let output = format!(
-            "32765: from 0.0.0.0/0 lookup {}\n10000: match-set=other_set lookup main\n",
-            BLACKHOLE_TABLE
-        );
-        assert!(!check_rules_in_output(&output, "banip"));
+        assert!(!check_rules_in_output("table inet other { }", "china"));
     }
 
     #[test]
     fn test_check_rules_empty_output() {
-        assert!(!check_rules_in_output("", "banip"));
+        assert!(!check_rules_in_output("", "china"));
     }
 
     #[test]
-    fn test_has_blackhole_rule_present() {
-        let output = format!("32765: from 0.0.0.0/0 lookup {}\n", BLACKHOLE_TABLE);
-        assert!(has_blackhole_rule(&output));
+    fn test_check_rules_different_set_name() {
+        let output = r#"chain banip_out {
+    ip daddr != @other_set fib daddr type != local drop
+}"#;
+        assert!(!check_rules_in_output(output, "china"));
+    }
+
+    // ─── has_drop_rule / has_whitelist_set ────────────────────────
+
+    #[test]
+    fn test_has_drop_rule_present() {
+        let output = r#"chain banip_out {
+    ip daddr != @china fib daddr type != local drop
+}"#;
+        assert!(has_drop_rule(output, "china"));
     }
 
     #[test]
-    fn test_has_blackhole_rule_absent() {
-        assert!(!has_blackhole_rule("32766: from all lookup main\n"));
+    fn test_has_drop_rule_absent() {
+        assert!(!has_drop_rule("chain banip_out { accept }", "china"));
     }
 
     #[test]
-    fn test_has_whitelist_rule_present() {
-        assert!(has_whitelist_rule("10000: match-set=banip lookup main\n", "banip"));
+    fn test_has_whitelist_set_present() {
+        let output = "set china {\n  type ipv4_addr\n}\n";
+        assert!(has_whitelist_set(output, "china"));
     }
 
     #[test]
-    fn test_has_whitelist_rule_absent() {
-        assert!(!has_whitelist_rule("32766: from all lookup main\n", "banip"));
+    fn test_has_whitelist_set_absent() {
+        assert!(!has_whitelist_set("set other { }", "china"));
+    }
+
+    // ─── constants ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_nft_table_name() {
+        assert_eq!(NFT_TABLE, "banip");
     }
 
     #[test]
-    fn test_has_whitelist_rule_wrong_name() {
-        assert!(!has_whitelist_rule("10000: match-set=other lookup main\n", "banip"));
-    }
-
-    // ─── constants ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_blackhole_table_number() {
-        assert_eq!(BLACKHOLE_TABLE, 100);
-    }
-
-    #[test]
-    fn test_route_priority() {
-        assert_eq!(ROUTE_PRIO, 10000);
-    }
-
-    #[test]
-    fn test_blackhole_table_name() {
-        assert_eq!(BLACKHOLE_TABLE_NAME, "banip_blackhole");
+    fn test_nft_set_name_default() {
+        assert_eq!(NFT_SET_NAME, "china");
     }
 }

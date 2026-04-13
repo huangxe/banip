@@ -11,12 +11,12 @@ const DATA_DIR: &str = "/var/lib/banip";
 const CIDR_FILE: &str = "cn_ip_cidr.txt";
 
 #[derive(Parser, Debug)]
-#[command(name = "banip", about = "Ban all non-China IP addresses using ipset + ip rule blackhole", version)]
+#[command(name = "banip", about = "Ban all non-China IP addresses using nftables", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Custom ipset set name (default: "banip")
+    /// Custom nftables set name (default: "china")
     #[arg(short, long, global = true, default_value = SET_NAME)]
     set: String,
 
@@ -27,17 +27,17 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Download the latest China IP CIDR list and rebuild ipset
+    /// Download the latest China IP CIDR list and rebuild nftables set
     Update {
         /// Custom download URL
         #[arg(short, long)]
         url: Option<String>,
     },
 
-    /// Enable: insert ip rule + blackhole route to block non-China traffic
+    /// Enable: create nftables rules to block non-China traffic
     Enable,
 
-    /// Disable: remove ip rule + blackhole route
+    /// Disable: remove nftables table and all rules
     Disable,
 
     /// Show current banip status
@@ -106,16 +106,16 @@ fn cmd_update(data_dir: &str, set_name: &str, url: Option<String>) {
         }
     }
 
-    println!("  Rebuilding ipset...");
-    let script = ipset::generate_ipset_restore(set_name, &cidrs);
-    ipset::execute_ipset_restore(&script).unwrap_or_else(|e| {
-        eprintln!("ipset restore failed: {}", e);
+    println!("  Rebuilding nftables set...");
+    let script = ipset::generate_nft_script(set_name, &cidrs);
+    ipset::execute_nft_script(&script).unwrap_or_else(|e| {
+        eprintln!("nft failed: {}", e);
         std::process::exit(1);
     });
 
     if was_enabled {
         println!("  Re-enabling rules...");
-        if let Err(e) = ipset::enable_rules(set_name) {
+        if let Err(e) = ipset::enable_rules(set_name, &cidrs) {
             eprintln!("Warning: re-enable failed: {}", e);
         }
     }
@@ -143,39 +143,56 @@ fn cmd_enable(data_dir: &str, set_name: &str) {
         return;
     }
 
-    // Check if ipset exists
+    // Load CIDR data
     let dir = PathBuf::from(data_dir);
     let cidr_path = dir.join(CIDR_FILE);
 
-    if !ipset::set_exists(set_name) {
-        if !cidr_path.exists() {
-            println!("No local CIDR data found, running update first...");
+    let cidrs = if !cidr_path.exists() {
+        println!("No local CIDR data found, running update first...");
+        // cmd_update will download, parse, and save CIDRs
+        // We need to re-read after update
+        cmd_update(data_dir, set_name, None);
+        let content = std::fs::read_to_string(&cidr_path).unwrap_or_else(|e| {
+            eprintln!("Error reading '{}': {}", cidr_path.display(), e);
+            std::process::exit(1);
+        });
+        cidr::parse_cidr_list(&content)
+    } else if !ipset::set_exists(set_name) {
+        // Set doesn't exist, build from local cache
+        println!("nftables set not found, building from local cache...");
+        let content = std::fs::read_to_string(&cidr_path).unwrap_or_else(|e| {
+            eprintln!("Error reading '{}': {}", cidr_path.display(), e);
+            std::process::exit(1);
+        });
+
+        let parsed = cidr::parse_cidr_list(&content);
+        if parsed.is_empty() {
+            eprintln!("Error: no valid CIDR ranges in cache. Running update...");
             cmd_update(data_dir, set_name, None);
-        } else {
-            // Load CIDR data and create ipset
-            println!("ipset not found, building from local cache...");
-            let content = std::fs::read_to_string(&cidr_path).unwrap_or_else(|e| {
+            let content2 = std::fs::read_to_string(&cidr_path).unwrap_or_else(|e| {
                 eprintln!("Error reading '{}': {}", cidr_path.display(), e);
                 std::process::exit(1);
             });
-
-            let cidrs = cidr::parse_cidr_list(&content);
-            if cidrs.is_empty() {
-                eprintln!("Error: no valid CIDR ranges in cache. Running update...");
-                cmd_update(data_dir, set_name, None);
-            } else {
-                println!("  Building ipset with {} entries...", cidrs.len());
-                let script = ipset::generate_ipset_restore(set_name, &cidrs);
-                ipset::execute_ipset_restore(&script).unwrap_or_else(|e| {
-                    eprintln!("ipset restore failed: {}", e);
-                    std::process::exit(1);
-                });
-            }
+            cidr::parse_cidr_list(&content2)
+        } else {
+            parsed
         }
+    } else {
+        // Set exists but rules not active — reload CIDRs from file
+        let content = std::fs::read_to_string(&cidr_path).unwrap_or_else(|e| {
+            eprintln!("Error reading '{}': {}", cidr_path.display(), e);
+            std::process::exit(1);
+        });
+        cidr::parse_cidr_list(&content)
+    };
+
+    if cidrs.is_empty() {
+        eprintln!("Error: no CIDR data available. Cannot enable.");
+        std::process::exit(1);
     }
 
-    // Insert ip rule + blackhole route
-    ipset::enable_rules(set_name).unwrap_or_else(|e| {
+    // Create nftables table + set + rules
+    ipset::enable_rules(set_name, &cidrs).unwrap_or_else(|e| {
         eprintln!("Enable failed: {}", e);
         std::process::exit(1);
     });
@@ -183,9 +200,13 @@ fn cmd_enable(data_dir: &str, set_name: &str) {
     // Update state
     let mut st = state::load(data_dir).unwrap_or_default();
     st.enabled = true;
+    st.cidr_count = cidrs.len();
+    if st.updated_at.is_empty() {
+        st.updated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    }
     state::save(data_dir, &st);
 
-    println!("Enabled. Non-China traffic is routed to blackhole.");
+    println!("Enabled. Non-China traffic is dropped by nftables.");
 }
 
 // ─── disable ───────────────────────────────────────────────────────────
@@ -208,7 +229,7 @@ fn cmd_disable(data_dir: &str, set_name: &str) {
     st.enabled = false;
     state::save(data_dir, &st);
 
-    println!("Disabled. ip rule + blackhole route removed.");
+    println!("Disabled. nftables table removed.");
 }
 
 // ─── state ─────────────────────────────────────────────────────────────
@@ -220,12 +241,11 @@ fn cmd_state(data_dir: &str, set_name: &str) {
     let set_info = ipset::get_set_info(set_name);
 
     println!("Status:     {}", if active { "ENABLED" } else { "DISABLED" });
-    println!("ipset:      {} ({})", set_name, if set_exists { "exists" } else { "not found" });
+    println!("nft set:    {} ({})", set_name, if set_exists { "exists" } else { "not found" });
 
     if let Some(info) = set_info {
         println!("Entries:    {}", info.elements);
         println!("Type:       {}", info.typ);
-        println!("References: {}", info.references);
     }
 
     println!("Data dir:   {}", data_dir);
