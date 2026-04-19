@@ -50,10 +50,38 @@ pub fn generate_nft_script(set_name: &str, cn_cidrs: &[Ipv4Net]) -> String {
         table
     ).unwrap();
 
-    // Rule: drop if destination NOT in China set (skip local addresses)
+    // Rule 1: skip loopback / local-interface addresses (127.x, ::1, etc.)
     writeln!(
         script,
-        "add rule inet {} banip_out ip daddr != @{} fib daddr type != local drop",
+        "add rule inet {} banip_out fib daddr type local accept",
+        table
+    ).unwrap();
+
+    // Rule 2: skip RFC 1918 private ranges (LAN, e.g. 192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+    writeln!(
+        script,
+        "add rule inet {} banip_out ip daddr {{ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }} accept",
+        table
+    ).unwrap();
+
+    // Rule 3: skip CGNAT / Tailscale range (100.64.0.0/10)
+    writeln!(
+        script,
+        "add rule inet {} banip_out ip daddr 100.64.0.0/10 accept",
+        table
+    ).unwrap();
+
+    // Rule 4: skip link-local addresses (169.254.0.0/16)
+    writeln!(
+        script,
+        "add rule inet {} banip_out ip daddr 169.254.0.0/16 accept",
+        table
+    ).unwrap();
+
+    // Rule 5: drop if destination NOT in China set
+    writeln!(
+        script,
+        "add rule inet {} banip_out ip daddr != @{} drop",
         table, set
     ).unwrap();
 
@@ -364,7 +392,46 @@ mod tests {
     fn test_generate_script_excludes_local_addresses() {
         let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
         let script = generate_nft_script("china", &cidrs);
-        assert!(script.contains("fib daddr type != local"));
+        // fib local accept rule should be present (replaces the old "!= local drop" approach)
+        assert!(script.contains("fib daddr type local accept"));
+    }
+
+    #[test]
+    fn test_generate_script_exempts_rfc1918() {
+        let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
+        let script = generate_nft_script("china", &cidrs);
+        // RFC 1918 private ranges must be accepted before the drop rule
+        assert!(script.contains("10.0.0.0/8"));
+        assert!(script.contains("172.16.0.0/12"));
+        assert!(script.contains("192.168.0.0/16"));
+    }
+
+    #[test]
+    fn test_generate_script_exempts_tailscale_cgnat() {
+        let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
+        let script = generate_nft_script("china", &cidrs);
+        // CGNAT / Tailscale (100.64.0.0/10) must be accepted
+        assert!(script.contains("100.64.0.0/10"));
+    }
+
+    #[test]
+    fn test_generate_script_exempts_link_local() {
+        let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
+        let script = generate_nft_script("china", &cidrs);
+        // Link-local (169.254.0.0/16) must be accepted
+        assert!(script.contains("169.254.0.0/16"));
+    }
+
+    #[test]
+    fn test_generate_script_exempt_rules_before_drop() {
+        let cidrs = vec![Ipv4Net::new(Ipv4Addr::new(1, 0, 0, 0), 24).unwrap()];
+        let script = generate_nft_script("china", &cidrs);
+        // All accept rules must appear before the final drop rule
+        let rfc1918_pos = script.find("192.168.0.0/16").unwrap();
+        let tailscale_pos = script.find("100.64.0.0/10").unwrap();
+        let drop_pos = script.rfind("drop").unwrap();
+        assert!(rfc1918_pos < drop_pos, "RFC1918 accept must be before drop");
+        assert!(tailscale_pos < drop_pos, "Tailscale accept must be before drop");
     }
 
     // ─── parse_nft_set_output ─────────────────────────────────────
